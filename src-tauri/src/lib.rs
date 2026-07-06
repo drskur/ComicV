@@ -1,3 +1,4 @@
+mod events;
 mod pdf;
 mod pipeline;
 mod waifu2x;

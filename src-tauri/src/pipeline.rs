@@ -5,8 +5,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use image::{DynamicImage, ExtendedColorType, ImageEncoder, RgbImage};
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 use zip::write::SimpleFileOptions;
+
+use crate::events::{self, log, progress};
 
 const IMAGE_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff", "avif",
@@ -25,45 +27,6 @@ pub struct ProcessOptions {
     pub format: String, // "cbz" | "pdf" | "folder"
     pub quality: u8,    // 40..100
     pub output_dir: String,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct LogEvent {
-    level: String,
-    message: String,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct ProgressEvent {
-    current: usize,
-    total: usize,
-    percent: u32,
-}
-
-fn log(app: &AppHandle, level: &str, message: impl Into<String>) {
-    let _ = app.emit(
-        "process://log",
-        LogEvent {
-            level: level.to_string(),
-            message: message.into(),
-        },
-    );
-}
-
-fn progress(app: &AppHandle, current: usize, total: usize) {
-    let percent = if total == 0 {
-        0
-    } else {
-        (current * 100 / total) as u32
-    };
-    let _ = app.emit(
-        "process://progress",
-        ProgressEvent {
-            current,
-            total,
-            percent,
-        },
-    );
 }
 
 fn is_image(path: &Path) -> bool {
@@ -249,6 +212,17 @@ fn encode(img: &RgbImage, quality: u8) -> Result<(Vec<u8>, &'static str), String
     }
 }
 
+/// 출력 폴더가 지정되지 않았을 때 입력 소스 위치를 기준으로 결정.
+/// 폴더/파일 모두 그 부모 디렉터리에 결과물을 만들어 원본 옆에 남긴다.
+fn default_output_dir(sources: &[String]) -> PathBuf {
+    let first = Path::new(&sources[0]);
+    first
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 fn job_name(sources: &[String]) -> String {
     sources
         .first()
@@ -285,7 +259,12 @@ fn run_inner(
         log(app, "info", "업스케일·노이즈 제거 없음 — 해상도 유지");
     }
 
-    let out_dir = Path::new(&opts.output_dir);
+    let out_dir = if opts.output_dir.trim().is_empty() {
+        default_output_dir(sources)
+    } else {
+        PathBuf::from(opts.output_dir.trim())
+    };
+    let out_dir = out_dir.as_path();
     fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
     let job = job_name(sources);
 
@@ -358,7 +337,7 @@ fn run(app: AppHandle, sources: Vec<String>, opts: ProcessOptions, cancel: Arc<A
     if let Err(e) = run_inner(&app, &sources, &opts, &cancel) {
         log(&app, "error", format!("처리 실패: {e}"));
     }
-    let _ = app.emit("process://done", ());
+    events::done(&app);
 }
 
 #[tauri::command]
@@ -370,9 +349,6 @@ pub fn start_processing(
 ) -> Result<(), String> {
     if sources.is_empty() {
         return Err("추가된 소스가 없습니다".to_string());
-    }
-    if options.output_dir.trim().is_empty() {
-        return Err("출력 경로를 지정하세요".to_string());
     }
     state.0.store(false, Ordering::Relaxed);
     let cancel = Arc::clone(&state.0);

@@ -10,21 +10,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use image::{GrayImage, RgbImage};
 use lopdf::Document;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
-fn emit_log(app: &AppHandle, level: &str, msg: String) {
-    let _ = app.emit(
-        "process://log",
-        serde_json::json!({ "level": level, "message": msg }),
-    );
-}
+use crate::events::log;
 
 /// PDF에서 이미지를 추출해 임시 파일 경로 목록으로 반환. 실패는 경고 로그 후 스킵.
 pub fn extract_pdf(path: &Path, app: &AppHandle) -> Vec<PathBuf> {
     let doc = match Document::load(path) {
         Ok(d) => d,
         Err(e) => {
-            emit_log(app, "warn", format!("PDF 열기 실패 {}: {e}", path.display()));
+            log(app, "warn", format!("PDF 열기 실패 {}: {e}", path.display()));
             return Vec::new();
         }
     };
@@ -41,7 +36,7 @@ pub fn extract_pdf(path: &Path, app: &AppHandle) -> Vec<PathBuf> {
         .join("comicv")
         .join(format!("{stem}_{nonce}"));
     if let Err(e) = fs::create_dir_all(&tmp) {
-        emit_log(app, "warn", format!("임시 폴더 생성 실패: {e}"));
+        log(app, "warn", format!("임시 폴더 생성 실패: {e}"));
         return Vec::new();
     }
 
@@ -51,7 +46,7 @@ pub fn extract_pdf(path: &Path, app: &AppHandle) -> Vec<PathBuf> {
         let images = match doc.get_page_images(page_id) {
             Ok(v) => v,
             Err(e) => {
-                emit_log(app, "warn", format!("{page_num}페이지 이미지 추출 실패: {e}"));
+                log(app, "warn", format!("{page_num}페이지 이미지 추출 실패: {e}"));
                 continue;
             }
         };
@@ -65,12 +60,12 @@ pub fn extract_pdf(path: &Path, app: &AppHandle) -> Vec<PathBuf> {
                 let p = tmp.join(format!("p{idx:04}.jpg"));
                 match fs::write(&p, img.content) {
                     Ok(_) => out.push(p),
-                    Err(e) => emit_log(app, "warn", format!("{page_num}페이지 저장 실패: {e}")),
+                    Err(e) => log(app, "warn", format!("{page_num}페이지 저장 실패: {e}")),
                 }
                 continue;
             }
             if has("JPXDecode") {
-                emit_log(
+                log(
                     app,
                     "warn",
                     format!("{page_num}페이지 스킵: JPEG2000(JPXDecode) 미지원"),
@@ -83,7 +78,7 @@ pub fn extract_pdf(path: &Path, app: &AppHandle) -> Vec<PathBuf> {
                 let p = tmp.join(format!("p{idx:04}.png"));
                 match dynimg.to_rgb8().save(&p) {
                     Ok(_) => out.push(p),
-                    Err(e) => emit_log(app, "warn", format!("{page_num}페이지 저장 실패: {e}")),
+                    Err(e) => log(app, "warn", format!("{page_num}페이지 저장 실패: {e}")),
                 }
                 continue;
             }
@@ -94,27 +89,26 @@ pub fn extract_pdf(path: &Path, app: &AppHandle) -> Vec<PathBuf> {
             let bpc = img.bits_per_component.unwrap_or(8);
             let cs = img.color_space.clone().unwrap_or_default().to_ascii_lowercase();
             let n = img.content.len();
-            let saved = if bpc == 8 && w > 0 && h > 0 {
-                let px = (w as usize) * (h as usize);
-                if n == px * 3 && (cs.contains("rgb") || cs.is_empty()) {
-                    RgbImage::from_raw(w, h, img.content.to_vec())
-                        .and_then(|b| b.save(tmp.join(format!("p{idx:04}.png"))).ok())
-                        .is_some()
-                } else if n == px && cs.contains("gray") {
-                    GrayImage::from_raw(w, h, img.content.to_vec())
-                        .and_then(|b| b.save(tmp.join(format!("p{idx:04}.png"))).ok())
-                        .is_some()
-                } else {
-                    false
-                }
+            let px = (w as usize) * (h as usize);
+            let png = tmp.join(format!("p{idx:04}.png"));
+            let saved = if bpc != 8 || px == 0 {
+                false
+            } else if n == px * 3 && (cs.contains("rgb") || cs.is_empty()) {
+                RgbImage::from_raw(w, h, img.content.to_vec())
+                    .and_then(|b| b.save(&png).ok())
+                    .is_some()
+            } else if n == px && cs.contains("gray") {
+                GrayImage::from_raw(w, h, img.content.to_vec())
+                    .and_then(|b| b.save(&png).ok())
+                    .is_some()
             } else {
                 false
             };
 
             if saved {
-                out.push(tmp.join(format!("p{idx:04}.png")));
+                out.push(png);
             } else {
-                emit_log(
+                log(
                     app,
                     "warn",
                     format!(
@@ -125,7 +119,7 @@ pub fn extract_pdf(path: &Path, app: &AppHandle) -> Vec<PathBuf> {
         }
     }
 
-    emit_log(
+    log(
         app,
         "info",
         format!(

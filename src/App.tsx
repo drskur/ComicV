@@ -15,6 +15,13 @@ function baseName(p: string): string {
   return parts[parts.length - 1] ?? p;
 }
 
+// 반복되는 Tailwind 클래스 묶음
+const BTN_GHOST =
+  "bg-transparent text-muted border border-edge rounded-md px-2.5 py-1 text-xs cursor-pointer transition-colors hover:text-ink hover:border-accent";
+const FIELD_CONTROL =
+  "bg-panel2 border border-edge rounded-md px-2.5 py-2 text-ink text-[13px] focus:outline-none focus:border-accent";
+const CHECKBOX = "w-4 h-4 accent-accent cursor-pointer";
+
 type LogLevel = "info" | "success" | "warn" | "error";
 interface LogLine {
   level: LogLevel;
@@ -22,7 +29,6 @@ interface LogLine {
   time: string;
 }
 
-// TODO: 백엔드 연동 시 실제 파일 메타로 교체
 interface SourceItem {
   id: number;
   name: string;
@@ -53,7 +59,7 @@ function App() {
   const [keepColor, setKeepColor] = createSignal(true);
 
   const [format, setFormat] = createSignal("cbz");
-  const [quality, setQuality] = createSignal(85);
+  const [quality, setQuality] = createSignal(100);
   const [outputDir, setOutputDir] = createSignal("");
 
   // ── 실행 상태 ─────────────────────────────
@@ -195,8 +201,8 @@ function App() {
             <div class="flex items-center justify-between px-3.5 py-3 border-b border-edge">
               <h2 class="text-sm font-semibold">소스</h2>
               <div class="flex gap-1.5">
-                <button class="bg-transparent text-muted border border-edge rounded-md px-2.5 py-1 text-xs cursor-pointer transition-colors hover:text-ink hover:border-accent" onClick={addFiles}>+ 파일</button>
-                <button class="bg-transparent text-muted border border-edge rounded-md px-2.5 py-1 text-xs cursor-pointer transition-colors hover:text-ink hover:border-accent" onClick={addFolder}>+ 폴더</button>
+                <button class={BTN_GHOST} onClick={addFiles}>+ 파일</button>
+                <button class={BTN_GHOST} onClick={addFolder}>+ 폴더</button>
                 <Show when={sources().length > 0}>
                   <button class="bg-transparent text-muted border border-edge rounded-md px-2.5 py-1 text-xs cursor-pointer transition-colors hover:text-bad hover:border-bad" onClick={clearSources}>비우기</button>
                 </Show>
@@ -239,14 +245,14 @@ function App() {
               <h3 class="text-xs font-semibold uppercase tracking-wider text-muted m-0">waifu2x · 업스케일 &amp; 노이즈</h3>
 
               <label class="flex items-center gap-2 text-[13px] cursor-pointer">
-                <input type="checkbox" class="w-4 h-4 accent-accent cursor-pointer" checked={useWaifu2x()} onChange={(e) => setUseWaifu2x(e.currentTarget.checked)} />
+                <input type="checkbox" class={CHECKBOX} checked={useWaifu2x()} onChange={(e) => setUseWaifu2x(e.currentTarget.checked)} />
                 <span>waifu2x 사용 <span class="text-muted">(끄면 변환만)</span></span>
               </label>
 
               <label class="flex flex-col gap-1.5 text-[13px]" classList={{ "opacity-40 pointer-events-none": !useWaifu2x() }}>
                 <span class="text-muted">업스케일 배율</span>
                 <select
-                  class="bg-panel2 border border-edge rounded-md px-2.5 py-2 text-ink text-[13px] focus:outline-none focus:border-accent"
+                  class={FIELD_CONTROL}
                   value={upscale()}
                   onChange={(e) => setUpscale(e.currentTarget.value)}
                 >
@@ -259,7 +265,7 @@ function App() {
               <label class="flex flex-col gap-1.5 text-[13px]" classList={{ "opacity-40 pointer-events-none": !useWaifu2x() }}>
                 <span class="text-muted">노이즈 제거 레벨</span>
                 <select
-                  class="bg-panel2 border border-edge rounded-md px-2.5 py-2 text-ink text-[13px] focus:outline-none focus:border-accent"
+                  class={FIELD_CONTROL}
                   value={denoiseLevel()}
                   onChange={(e) => setDenoiseLevel(e.currentTarget.value)}
                 >
@@ -276,7 +282,7 @@ function App() {
               <h3 class="text-xs font-semibold uppercase tracking-wider text-muted m-0">종이 화이트닝</h3>
 
               <label class="flex items-center gap-2 text-[13px] cursor-pointer">
-                <input type="checkbox" class="w-4 h-4 accent-accent cursor-pointer" checked={whiten()} onChange={(e) => setWhiten(e.currentTarget.checked)} />
+                <input type="checkbox" class={CHECKBOX} checked={whiten()} onChange={(e) => setWhiten(e.currentTarget.checked)} />
                 <span>스캔 종이색을 흰색으로 보정</span>
               </label>
 
@@ -293,7 +299,7 @@ function App() {
               </label>
 
               <label class="flex items-center gap-2 text-[13px] cursor-pointer" classList={{ "opacity-40 pointer-events-none": !whiten() }}>
-                <input type="checkbox" class="w-4 h-4 accent-accent cursor-pointer" checked={keepColor()} onChange={(e) => setKeepColor(e.currentTarget.checked)} />
+                <input type="checkbox" class={CHECKBOX} checked={keepColor()} onChange={(e) => setKeepColor(e.currentTarget.checked)} />
                 <span>컬러 페이지 색감 보존</span>
               </label>
             </div>
@@ -304,7 +310,7 @@ function App() {
               <label class="flex flex-col gap-1.5 text-[13px]">
                 <span class="text-muted">출력 포맷</span>
                 <select
-                  class="bg-panel2 border border-edge rounded-md px-2.5 py-2 text-ink text-[13px] focus:outline-none focus:border-accent"
+                  class={FIELD_CONTROL}
                   value={format()}
                   onChange={(e) => setFormat(e.currentTarget.value)}
                 >
@@ -327,16 +333,16 @@ function App() {
               </label>
 
               <label class="flex flex-col gap-1.5 text-[13px]">
-                <span class="text-muted">출력 경로</span>
+                <span class="text-muted">출력 경로 <span class="opacity-70">(선택 · 비우면 입력 폴더 기준)</span></span>
                 <div class="flex gap-1.5">
                   <input
                     type="text"
-                    class="flex-1 bg-panel2 border border-edge rounded-md px-2.5 py-2 text-ink text-[13px] focus:outline-none focus:border-accent"
-                    placeholder="출력 폴더 선택…"
+                    class={`flex-1 ${FIELD_CONTROL}`}
+                    placeholder="비우면 입력 폴더에 저장…"
                     value={outputDir()}
                     onInput={(e) => setOutputDir(e.currentTarget.value)}
                   />
-                  <button class="bg-transparent text-muted border border-edge rounded-md px-2.5 py-1 text-xs cursor-pointer transition-colors hover:text-ink hover:border-accent" onClick={pickOutputDir}>찾기</button>
+                  <button class={BTN_GHOST} onClick={pickOutputDir}>찾기</button>
                 </div>
               </label>
             </div>

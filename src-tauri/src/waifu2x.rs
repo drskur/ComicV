@@ -11,16 +11,10 @@ use std::path::PathBuf;
 
 use image::{Rgb, RgbImage};
 use ort::session::Session;
-use tauri::{path::BaseDirectory, AppHandle, Emitter, Manager};
+use tauri::{path::BaseDirectory, AppHandle, Manager};
 
+use crate::events::log;
 use crate::pipeline::ProcessOptions;
-
-fn emit_log(app: &AppHandle, level: &str, msg: String) {
-    let _ = app.emit(
-        "process://log",
-        serde_json::json!({ "level": level, "message": msg }),
-    );
-}
 
 fn denoise_opt(s: &str) -> Option<u8> {
     match s {
@@ -78,7 +72,7 @@ fn load_session(app: &AppHandle, name: &str) -> Result<Session, String> {
             .with_execution_providers([ort::ep::directml::DirectML::default().build()])
             .map_err(|e| e.to_string())?;
     }
-    emit_log(
+    log(
         app,
         "info",
         format!("EP: {}", if use_dml { "DirectML" } else { "CPU" }),
@@ -121,13 +115,13 @@ impl Engine {
 
         // 1x 모델 offset 28(scale 1 → pad 28), 2x 모델 offset 36(scale 2 → pad 18).
         let first_pad = if two_x { OFFSET_2X / 2 } else { OFFSET_1X };
-        emit_log(app, "info", format!("waifu2x 모델 로드: {first}"));
+        log(app, "info", format!("waifu2x 모델 로드: {first}"));
         let mut passes = vec![Pass {
             session: load_session(app, &first)?,
             pad: first_pad,
         }];
         if factor == 4 {
-            emit_log(app, "info", "waifu2x 모델 로드: scale2x.onnx (4x 2번째 패스)".to_string());
+            log(app, "info", "waifu2x 모델 로드: scale2x.onnx (4x 2번째 패스)".to_string());
             passes.push(Pass {
                 session: load_session(app, "scale2x.onnx")?,
                 pad: OFFSET_2X / 2,
@@ -189,7 +183,7 @@ fn run_pass(
     if pass == 1 {
         let out_mean = out.iter().map(|&v| v as f64).sum::<f64>() / out.len() as f64;
         if out_mean < 0.05 {
-            emit_log(
+            log(
                 app,
                 "warn",
                 format!("출력이 비정상적으로 어두움(mean={out_mean:.4}) — 엔진/EP 확인 필요"),
@@ -216,7 +210,7 @@ fn run_pass(
     let cropped = image::imageops::crop_imm(&full, 0, 0, cw, ch).to_image();
 
     if pass == 1 {
-        emit_log(
+        log(
             app,
             "info",
             format!("waifu2x {pass}/{total}: {w}x{h} → {ow}x{oh} (scale {scale})"),
