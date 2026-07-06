@@ -1,2 +1,6 @@
 node_modules
 dist
+.claude/settings.local.json
+
+# ONNX 모델 가중치 (scripts/fetch-models.ps1로 받음)
+src-tauri/resources/models/

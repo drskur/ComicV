@@ -1,5 +1,7 @@
-import { createSignal, For, Show } from "solid-js";
+import { createSignal, For, Show, onMount } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import "./App.css";
 
 // 지원 입력: 이미지 / PDF / CBZ·CBR 아카이브
@@ -40,11 +42,14 @@ function App() {
   let nextId = 1;
 
   // ── 옵션 ─────────────────────────────────
+  // waifu2x: 업스케일 배율(-s) + 노이즈 제거 레벨(-n)
   const [upscale, setUpscale] = createSignal("2x");
-  const [denoise, setDenoise] = createSignal(true);
-  const [sharpen, setSharpen] = createSignal(false);
-  const [autoLevel, setAutoLevel] = createSignal(true);
-  const [grayscale, setGrayscale] = createSignal(false);
+  const [denoiseLevel, setDenoiseLevel] = createSignal("1");
+
+  // 종이 화이트닝: 스캔 배경색을 흰색으로
+  const [whiten, setWhiten] = createSignal(true);
+  const [whiteStrength, setWhiteStrength] = createSignal(70);
+  const [keepColor, setKeepColor] = createSignal(true);
 
   const [format, setFormat] = createSignal("cbz");
   const [quality, setQuality] = createSignal(85);
@@ -59,6 +64,15 @@ function App() {
     const time = new Date().toLocaleTimeString("ko-KR", { hour12: false });
     setLogs((prev) => [...prev, { level, message, time }]);
   }
+
+  // ── 백엔드 이벤트 구독 ─────────────────────
+  onMount(async () => {
+    await listen<{ level: LogLevel; message: string }>("process://log", (e) =>
+      pushLog(e.payload.level, e.payload.message),
+    );
+    await listen<{ percent: number }>("process://progress", (e) => setProgress(e.payload.percent));
+    await listen("process://done", () => setRunning(false));
+  });
 
   // ── 소스 조작 ─────────────────────────────
   function addPaths(paths: string[]) {
@@ -104,32 +118,30 @@ function App() {
     if (typeof dir === "string") setOutputDir(dir);
   }
 
-  // ── 시작 (임시 목업 스트리밍) ───────────────
-  function start() {
+  // ── 시작 ─────────────────────────────────
+  async function start() {
     if (running() || sources().length === 0) return;
     setRunning(true);
     setProgress(0);
     setLogs([]);
-    pushLog("info", `${sources().length}개 항목 처리 시작`);
-
-    // TODO: invoke("start_processing", { files, options }) + 이벤트 리스너로 교체
-    const items = sources();
-    let i = 0;
-    const timer = setInterval(() => {
-      if (i >= items.length) {
-        clearInterval(timer);
-        setProgress(100);
-        pushLog("success", "모든 작업 완료 🎉");
-        setRunning(false);
-        return;
-      }
-      const item = items[i];
-      pushLog("info", `[${i + 1}/${items.length}] ${item.name} 이미지 개선 중…`);
-      pushLog("info", `  · 업스케일 ${upscale()} / 노이즈제거 ${denoise() ? "on" : "off"}`);
-      pushLog("success", `  · ${format().toUpperCase()} 패키징 완료`);
-      i++;
-      setProgress(Math.round((i / items.length) * 100));
-    }, 500);
+    try {
+      await invoke("start_processing", {
+        sources: sources().map((s) => s.path),
+        options: {
+          upscale: upscale(),
+          denoiseLevel: denoiseLevel(),
+          whiten: whiten(),
+          whiteStrength: whiteStrength(),
+          keepColor: keepColor(),
+          format: format(),
+          quality: quality(),
+          outputDir: outputDir(),
+        },
+      });
+    } catch (err) {
+      pushLog("error", String(err));
+      setRunning(false);
+    }
   }
 
   return (
@@ -201,36 +213,60 @@ function App() {
             </div>
 
             <div class="p-3.5 border-b border-edge flex flex-col gap-3">
-              <h3 class="text-xs font-semibold uppercase tracking-wider text-muted m-0">이미지 개선</h3>
+              <h3 class="text-xs font-semibold uppercase tracking-wider text-muted m-0">waifu2x · 업스케일 &amp; 노이즈</h3>
 
               <label class="flex flex-col gap-1.5 text-[13px]">
-                <span class="text-muted">업스케일</span>
+                <span class="text-muted">업스케일 배율</span>
                 <select
                   class="bg-panel2 border border-edge rounded-md px-2.5 py-2 text-ink text-[13px] focus:outline-none focus:border-accent"
                   value={upscale()}
                   onChange={(e) => setUpscale(e.currentTarget.value)}
                 >
-                  <option value="none">없음</option>
+                  <option value="none">없음 (1x)</option>
                   <option value="2x">2x</option>
                   <option value="4x">4x</option>
                 </select>
               </label>
 
-              <label class="flex items-center gap-2 text-[13px] cursor-pointer">
-                <input type="checkbox" class="w-4 h-4 accent-accent cursor-pointer" checked={denoise()} onChange={(e) => setDenoise(e.currentTarget.checked)} />
-                <span>노이즈 제거</span>
+              <label class="flex flex-col gap-1.5 text-[13px]">
+                <span class="text-muted">노이즈 제거 레벨</span>
+                <select
+                  class="bg-panel2 border border-edge rounded-md px-2.5 py-2 text-ink text-[13px] focus:outline-none focus:border-accent"
+                  value={denoiseLevel()}
+                  onChange={(e) => setDenoiseLevel(e.currentTarget.value)}
+                >
+                  <option value="none">없음</option>
+                  <option value="0">0 (약)</option>
+                  <option value="1">1 (기본)</option>
+                  <option value="2">2 (강)</option>
+                  <option value="3">3 (최강)</option>
+                </select>
               </label>
+            </div>
+
+            <div class="p-3.5 border-b border-edge flex flex-col gap-3">
+              <h3 class="text-xs font-semibold uppercase tracking-wider text-muted m-0">종이 화이트닝</h3>
+
               <label class="flex items-center gap-2 text-[13px] cursor-pointer">
-                <input type="checkbox" class="w-4 h-4 accent-accent cursor-pointer" checked={sharpen()} onChange={(e) => setSharpen(e.currentTarget.checked)} />
-                <span>샤픈 (선명하게)</span>
+                <input type="checkbox" class="w-4 h-4 accent-accent cursor-pointer" checked={whiten()} onChange={(e) => setWhiten(e.currentTarget.checked)} />
+                <span>스캔 종이색을 흰색으로 보정</span>
               </label>
-              <label class="flex items-center gap-2 text-[13px] cursor-pointer">
-                <input type="checkbox" class="w-4 h-4 accent-accent cursor-pointer" checked={autoLevel()} onChange={(e) => setAutoLevel(e.currentTarget.checked)} />
-                <span>자동 레벨/대비 보정</span>
+
+              <label class="flex flex-col gap-1.5 text-[13px]" classList={{ "opacity-40 pointer-events-none": !whiten() }}>
+                <span class="text-muted">강도 ({whiteStrength()})</span>
+                <input
+                  type="range"
+                  class="accent-accent"
+                  min="0"
+                  max="100"
+                  value={whiteStrength()}
+                  onInput={(e) => setWhiteStrength(+e.currentTarget.value)}
+                />
               </label>
-              <label class="flex items-center gap-2 text-[13px] cursor-pointer">
-                <input type="checkbox" class="w-4 h-4 accent-accent cursor-pointer" checked={grayscale()} onChange={(e) => setGrayscale(e.currentTarget.checked)} />
-                <span>흑백 변환</span>
+
+              <label class="flex items-center gap-2 text-[13px] cursor-pointer" classList={{ "opacity-40 pointer-events-none": !whiten() }}>
+                <input type="checkbox" class="w-4 h-4 accent-accent cursor-pointer" checked={keepColor()} onChange={(e) => setKeepColor(e.currentTarget.checked)} />
+                <span>컬러 페이지 색감 보존</span>
               </label>
             </div>
 

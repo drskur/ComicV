@@ -23,4 +23,13 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+image = "0.25"
+zip = "2"
+
+# ONNX 추론 (Windows에서는 DirectML EP 활성화)
+[target.'cfg(windows)'.dependencies]
+ort = { version = "2.0.0-rc.12", features = ["directml"] }
+
+[target.'cfg(not(windows))'.dependencies]
+ort = "2.0.0-rc.12"
 
