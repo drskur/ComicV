@@ -63,18 +63,41 @@ fn load_session(app: &AppHandle, name: &str) -> Result<Session, String> {
     if !path.exists() {
         return Err(format!("모델 파일 없음: {}", path.display()));
     }
+    #[allow(unused_mut)]
     let mut builder = Session::builder().map_err(|e| e.to_string())?;
+
+    // 기본 CPU(정확). DirectML은 입력 크기에 따라 출력이 붕괴하는 오산이 있어
+    // 아직 신뢰 불가 → 실험적 opt-in(COMICV_DML=1). 안정화는 고정 타일로 예정.
+    let use_dml = std::env::var("COMICV_DML").ok().as_deref() == Some("1");
     #[cfg(windows)]
-    {
+    if use_dml {
+        // DML이 융합된 연산을 오산하는 걸 우회: 그래프 최적화 끄기.
         builder = builder
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Disable)
+            .map_err(|e| e.to_string())?
             .with_execution_providers([ort::ep::directml::DirectML::default().build()])
             .map_err(|e| e.to_string())?;
     }
+    emit_log(
+        app,
+        "info",
+        format!("EP: {}", if use_dml { "DirectML" } else { "CPU" }),
+    );
+
     builder.commit_from_file(&path).map_err(|e| e.to_string())
 }
 
+/// cunet offset(출력에서 잘리는 테두리, 출력 px 기준). 입력 패딩 = offset/scale.
+const OFFSET_1X: u32 = 28;
+const OFFSET_2X: u32 = 36;
+
+struct Pass {
+    session: Session,
+    pad: u32, // 추론 전 입력 사방에 넣을 엣지 패딩(입력 px)
+}
+
 pub struct Engine {
-    passes: Vec<Session>,
+    passes: Vec<Pass>,
 }
 
 impl Engine {
@@ -96,11 +119,19 @@ impl Engine {
             None => return Ok(None),
         };
 
+        // 1x 모델 offset 28(scale 1 → pad 28), 2x 모델 offset 36(scale 2 → pad 18).
+        let first_pad = if two_x { OFFSET_2X / 2 } else { OFFSET_1X };
         emit_log(app, "info", format!("waifu2x 모델 로드: {first}"));
-        let mut passes = vec![load_session(app, &first)?];
+        let mut passes = vec![Pass {
+            session: load_session(app, &first)?,
+            pad: first_pad,
+        }];
         if factor == 4 {
             emit_log(app, "info", "waifu2x 모델 로드: scale2x.onnx (4x 2번째 패스)".to_string());
-            passes.push(load_session(app, "scale2x.onnx")?);
+            passes.push(Pass {
+                session: load_session(app, "scale2x.onnx")?,
+                pad: OFFSET_2X / 2,
+            });
         }
         Ok(Some(Engine { passes }))
     }
@@ -108,8 +139,9 @@ impl Engine {
     pub fn process(&mut self, img: &RgbImage, app: &AppHandle) -> Result<RgbImage, String> {
         let total = self.passes.len();
         let mut cur = img.clone();
-        for (i, sess) in self.passes.iter_mut().enumerate() {
-            cur = run_pass(sess, &cur, app, i + 1, total)?;
+        for i in 0..self.passes.len() {
+            let pad = self.passes[i].pad;
+            cur = run_pass(&mut self.passes[i].session, pad, &cur, app, i + 1, total)?;
         }
         Ok(cur)
     }
@@ -117,6 +149,7 @@ impl Engine {
 
 fn run_pass(
     sess: &mut Session,
+    pad: u32,
     img: &RgbImage,
     app: &AppHandle,
     pass: usize,
@@ -124,15 +157,16 @@ fn run_pass(
 ) -> Result<RgbImage, String> {
     let (w, h) = (img.width(), img.height());
 
-    // cunet은 입력 크기가 4의 배수여야 함 → 우/하단 엣지 복제 패딩.
-    let pw = (w + 3) / 4 * 4;
-    let ph = (h + 3) / 4 * 4;
+    // 사방 pad(입력 px)만큼 엣지 복제 + 4의 배수로 정렬(우/하단 여분).
+    // 이렇게 하면 모델이 offset을 잘라도 출력 좌상단이 원본 (0,0)과 정렬됨.
+    let pw = (w + 2 * pad + 3) / 4 * 4;
+    let ph = (h + 2 * pad + 3) / 4 * 4;
     let plane = (pw * ph) as usize;
     let mut data = vec![0f32; 3 * plane];
     for y in 0..ph {
-        let sy = y.min(h - 1);
+        let sy = ((y as i64 - pad as i64).clamp(0, (h - 1) as i64)) as u32;
         for x in 0..pw {
-            let sx = x.min(w - 1);
+            let sx = ((x as i64 - pad as i64).clamp(0, (w - 1) as i64)) as u32;
             let px = img.get_pixel(sx, sy);
             let idx = (y * pw + x) as usize;
             data[idx] = px[0] as f32 / 255.0;
@@ -140,9 +174,6 @@ fn run_pass(
             data[2 * plane + idx] = px[2] as f32 / 255.0;
         }
     }
-
-    // 진단: 입력 값 범위
-    let in_mean = data.iter().map(|&v| v as f64).sum::<f64>() / data.len() as f64;
 
     let input =
         ort::value::Tensor::from_array(([1usize, 3, ph as usize, pw as usize], data))
@@ -154,29 +185,16 @@ fn run_pass(
     let oh = shape[2] as u32;
     let ow = shape[3] as u32;
 
-    // 진단: 출력 값 범위 (검은 결과물 원인 추적)
+    // 출력 붕괴 감지(예: DML 오산). 정상이면 조용히 넘어감.
     if pass == 1 {
-        let mut mn = f32::MAX;
-        let mut mx = f32::MIN;
-        let mut sum = 0f64;
-        for &v in out.iter() {
-            if v < mn {
-                mn = v;
-            }
-            if v > mx {
-                mx = v;
-            }
-            sum += v as f64;
+        let out_mean = out.iter().map(|&v| v as f64).sum::<f64>() / out.len() as f64;
+        if out_mean < 0.05 {
+            emit_log(
+                app,
+                "warn",
+                format!("출력이 비정상적으로 어두움(mean={out_mean:.4}) — 엔진/EP 확인 필요"),
+            );
         }
-        let out_mean = sum / out.len() as f64;
-        emit_log(
-            app,
-            "info",
-            format!(
-                "진단 shape=[{:?}] 입력mean={in_mean:.4} 출력 min={mn:.4} max={mx:.4} mean={out_mean:.4}",
-                &shape
-            ),
-        );
     }
     let scale = (ow as f32 / pw as f32).round().max(1.0) as u32;
 
