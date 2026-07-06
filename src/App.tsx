@@ -1,5 +1,17 @@
 import { createSignal, For, Show } from "solid-js";
+import { open } from "@tauri-apps/plugin-dialog";
 import "./App.css";
+
+// 지원 입력: 이미지 / PDF / CBZ·CBR 아카이브
+const IMAGE_EXTS = ["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff", "avif"];
+const ARCHIVE_EXTS = ["cbz", "cbr", "zip"];
+const DOC_EXTS = ["pdf"];
+const ALL_EXTS = [...IMAGE_EXTS, ...ARCHIVE_EXTS, ...DOC_EXTS];
+
+function baseName(p: string): string {
+  const parts = p.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] ?? p;
+}
 
 type LogLevel = "info" | "success" | "warn" | "error";
 interface LogLine {
@@ -48,22 +60,35 @@ function App() {
     setLogs((prev) => [...prev, { level, message, time }]);
   }
 
-  // ── 소스 조작 (임시 목업) ──────────────────
-  function addFiles() {
-    // TODO: Tauri dialog.open({ multiple: true }) 연동
-    const n = sources().length + 1;
-    setSources((prev) => [
-      ...prev,
-      { id: nextId++, name: `page-${String(n).padStart(3, "0")}.png`, path: `C:/comics/vol-01/page-${n}.png` },
-    ]);
+  // ── 소스 조작 ─────────────────────────────
+  function addPaths(paths: string[]) {
+    setSources((prev) => {
+      const existing = new Set(prev.map((s) => s.path));
+      const added = paths
+        .filter((p) => !existing.has(p))
+        .map((p) => ({ id: nextId++, name: baseName(p), path: p }));
+      return [...prev, ...added];
+    });
   }
 
-  function addFolder() {
-    // TODO: Tauri dialog.open({ directory: true }) 연동
-    setSources((prev) => [
-      ...prev,
-      { id: nextId++, name: "vol-01/", path: "C:/comics/vol-01" },
-    ]);
+  async function addFiles() {
+    const selected = await open({
+      multiple: true,
+      filters: [
+        { name: "만화 파일 (이미지·PDF·CBZ)", extensions: ALL_EXTS },
+        { name: "이미지", extensions: IMAGE_EXTS },
+        { name: "PDF", extensions: DOC_EXTS },
+        { name: "아카이브 (CBZ/CBR/ZIP)", extensions: ARCHIVE_EXTS },
+      ],
+    });
+    if (!selected) return;
+    addPaths(Array.isArray(selected) ? selected : [selected]);
+  }
+
+  async function addFolder() {
+    const selected = await open({ directory: true, multiple: true });
+    if (!selected) return;
+    addPaths(Array.isArray(selected) ? selected : [selected]);
   }
 
   function removeSource(id: number) {
@@ -72,6 +97,11 @@ function App() {
 
   function clearSources() {
     setSources([]);
+  }
+
+  async function pickOutputDir() {
+    const dir = await open({ directory: true });
+    if (typeof dir === "string") setOutputDir(dir);
   }
 
   // ── 시작 (임시 목업 스트리밍) ───────────────
@@ -144,7 +174,7 @@ function App() {
                 fallback={
                   <div class="flex flex-col items-center justify-center gap-1.5 text-muted text-center py-8">
                     <p class="text-sm m-0">처리할 파일이나 폴더를 추가하세요</p>
-                    <span class="text-xs opacity-70">이미지 파일 또는 1권 폴더</span>
+                    <span class="text-xs opacity-70">이미지 · PDF · CBZ/CBR 또는 이미지 폴더</span>
                   </div>
                 }
               >
@@ -242,8 +272,7 @@ function App() {
                     value={outputDir()}
                     onInput={(e) => setOutputDir(e.currentTarget.value)}
                   />
-                  {/* TODO: dialog.open({ directory: true }) */}
-                  <button class="bg-transparent text-muted border border-edge rounded-md px-2.5 py-1 text-xs cursor-pointer transition-colors hover:text-ink hover:border-accent" onClick={() => setOutputDir("C:/comics/output")}>찾기</button>
+                  <button class="bg-transparent text-muted border border-edge rounded-md px-2.5 py-1 text-xs cursor-pointer transition-colors hover:text-ink hover:border-accent" onClick={pickOutputDir}>찾기</button>
                 </div>
               </label>
             </div>
