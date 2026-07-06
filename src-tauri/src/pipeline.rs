@@ -1,6 +1,8 @@
 use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use image::{DynamicImage, ExtendedColorType, ImageEncoder, RgbImage};
 use tauri::{AppHandle, Emitter};
@@ -14,6 +16,7 @@ const IMAGE_EXTS: &[&str] = &[
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessOptions {
+    pub use_waifu2x: bool,     // false면 엔진 바이패스(변환/재패키징만)
     pub upscale: String,       // "none" | "2x" | "4x"
     pub denoise_level: String, // "none" | "0".."3"
     pub whiten: bool,
@@ -170,14 +173,10 @@ fn collect_pages(path: &Path, app: &AppHandle) -> Vec<PageRef> {
                 })
                 .collect()
         }
-        "pdf" => {
-            log(
-                app,
-                "warn",
-                format!("PDF 입력은 아직 미지원(렌더러 필요): {}", path.display()),
-            );
-            Vec::new()
-        }
+        "pdf" => crate::pdf::extract_pdf(path, app)
+            .into_iter()
+            .map(PageRef::File)
+            .collect(),
         e if IMAGE_EXTS.contains(&e) => vec![PageRef::File(path.to_path_buf())],
         _ => {
             log(app, "warn", format!("지원하지 않는 형식: {}", path.display()));
@@ -261,7 +260,16 @@ fn job_name(sources: &[String]) -> String {
         .unwrap_or_else(|| "output".to_string())
 }
 
-fn run_inner(app: &AppHandle, sources: &[String], opts: &ProcessOptions) -> Result<(), String> {
+/// 실행 중 취소 플래그(관리 상태). 여러 작업이 동시에 돌지 않는다는 가정.
+#[derive(Default)]
+pub struct CancelFlag(pub Arc<AtomicBool>);
+
+fn run_inner(
+    app: &AppHandle,
+    sources: &[String],
+    opts: &ProcessOptions,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
     let mut pages: Vec<PageRef> = Vec::new();
     for s in sources {
         pages.append(&mut collect_pages(Path::new(s), app));
@@ -303,6 +311,10 @@ fn run_inner(app: &AppHandle, sources: &[String], opts: &ProcessOptions) -> Resu
     };
 
     for (i, page) in pages.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            log(app, "warn", "사용자에 의해 중지됨");
+            break;
+        }
         log(app, "info", format!("[{}/{}] {}", i + 1, total, page.name()));
 
         let mut rgb = page.load()?.to_rgb8();
@@ -334,12 +346,16 @@ fn run_inner(app: &AppHandle, sources: &[String], opts: &ProcessOptions) -> Resu
         zw.finish().map_err(|e| e.to_string())?;
     }
 
-    log(app, "success", format!("완료 → {}", out_dir.display()));
+    if cancel.load(Ordering::Relaxed) {
+        log(app, "warn", format!("중지됨 (부분 저장 → {})", out_dir.display()));
+    } else {
+        log(app, "success", format!("완료 → {}", out_dir.display()));
+    }
     Ok(())
 }
 
-fn run(app: AppHandle, sources: Vec<String>, opts: ProcessOptions) {
-    if let Err(e) = run_inner(&app, &sources, &opts) {
+fn run(app: AppHandle, sources: Vec<String>, opts: ProcessOptions, cancel: Arc<AtomicBool>) {
+    if let Err(e) = run_inner(&app, &sources, &opts, &cancel) {
         log(&app, "error", format!("처리 실패: {e}"));
     }
     let _ = app.emit("process://done", ());
@@ -348,6 +364,7 @@ fn run(app: AppHandle, sources: Vec<String>, opts: ProcessOptions) {
 #[tauri::command]
 pub fn start_processing(
     app: AppHandle,
+    state: tauri::State<'_, CancelFlag>,
     sources: Vec<String>,
     options: ProcessOptions,
 ) -> Result<(), String> {
@@ -357,6 +374,13 @@ pub fn start_processing(
     if options.output_dir.trim().is_empty() {
         return Err("출력 경로를 지정하세요".to_string());
     }
-    std::thread::spawn(move || run(app, sources, options));
+    state.0.store(false, Ordering::Relaxed);
+    let cancel = Arc::clone(&state.0);
+    std::thread::spawn(move || run(app, sources, options, cancel));
     Ok(())
+}
+
+#[tauri::command]
+pub fn cancel_processing(state: tauri::State<'_, CancelFlag>) {
+    state.0.store(true, Ordering::Relaxed);
 }

@@ -43,6 +43,7 @@ function App() {
 
   // ── 옵션 ─────────────────────────────────
   // waifu2x: 업스케일 배율(-s) + 노이즈 제거 레벨(-n)
+  const [useWaifu2x, setUseWaifu2x] = createSignal(true);
   const [upscale, setUpscale] = createSignal("2x");
   const [denoiseLevel, setDenoiseLevel] = createSignal("1");
 
@@ -128,6 +129,7 @@ function App() {
       await invoke("start_processing", {
         sources: sources().map((s) => s.path),
         options: {
+          useWaifu2x: useWaifu2x(),
           upscale: upscale(),
           denoiseLevel: denoiseLevel(),
           whiten: whiten(),
@@ -144,6 +146,15 @@ function App() {
     }
   }
 
+  async function cancel() {
+    try {
+      await invoke("cancel_processing");
+      pushLog("warn", "중지 요청됨 — 현재 페이지까지 마무리 후 정지합니다");
+    } catch (err) {
+      pushLog("error", String(err));
+    }
+  }
+
   return (
     <div class="flex flex-col h-screen p-3.5 gap-3.5">
       {/* 헤더 */}
@@ -155,13 +166,25 @@ function App() {
             <p class="text-xs text-muted">만화 이미지 개선 &amp; 패키징</p>
           </div>
         </div>
-        <button
-          class="bg-accent hover:bg-accent-hover disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-lg px-5 py-2.5 text-[15px] font-semibold cursor-pointer transition-colors"
-          disabled={running() || sources().length === 0}
-          onClick={start}
+        <Show
+          when={running()}
+          fallback={
+            <button
+              class="bg-accent hover:bg-accent-hover disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-lg px-5 py-2.5 text-[15px] font-semibold cursor-pointer transition-colors"
+              disabled={sources().length === 0}
+              onClick={start}
+            >
+              ▶ 시작
+            </button>
+          }
         >
-          {running() ? "처리 중…" : "▶ 시작"}
-        </button>
+          <button
+            class="bg-bad hover:brightness-110 text-white rounded-lg px-5 py-2.5 text-[15px] font-semibold cursor-pointer transition-all"
+            onClick={cancel}
+          >
+            ■ 정지
+          </button>
+        </Show>
       </header>
 
       {/* 본문: 사이드바(소스+옵션) + 콘솔 */}
@@ -215,7 +238,12 @@ function App() {
             <div class="p-3.5 border-b border-edge flex flex-col gap-3">
               <h3 class="text-xs font-semibold uppercase tracking-wider text-muted m-0">waifu2x · 업스케일 &amp; 노이즈</h3>
 
-              <label class="flex flex-col gap-1.5 text-[13px]">
+              <label class="flex items-center gap-2 text-[13px] cursor-pointer">
+                <input type="checkbox" class="w-4 h-4 accent-accent cursor-pointer" checked={useWaifu2x()} onChange={(e) => setUseWaifu2x(e.currentTarget.checked)} />
+                <span>waifu2x 사용 <span class="text-muted">(끄면 변환만)</span></span>
+              </label>
+
+              <label class="flex flex-col gap-1.5 text-[13px]" classList={{ "opacity-40 pointer-events-none": !useWaifu2x() }}>
                 <span class="text-muted">업스케일 배율</span>
                 <select
                   class="bg-panel2 border border-edge rounded-md px-2.5 py-2 text-ink text-[13px] focus:outline-none focus:border-accent"
@@ -228,7 +256,7 @@ function App() {
                 </select>
               </label>
 
-              <label class="flex flex-col gap-1.5 text-[13px]">
+              <label class="flex flex-col gap-1.5 text-[13px]" classList={{ "opacity-40 pointer-events-none": !useWaifu2x() }}>
                 <span class="text-muted">노이즈 제거 레벨</span>
                 <select
                   class="bg-panel2 border border-edge rounded-md px-2.5 py-2 text-ink text-[13px] focus:outline-none focus:border-accent"

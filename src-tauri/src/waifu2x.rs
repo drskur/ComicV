@@ -80,6 +80,9 @@ pub struct Engine {
 impl Engine {
     /// 옵션에 해당하는 엔진 구성. 처리할 게 없으면(1x·노이즈 없음) None.
     pub fn new(app: &AppHandle, opts: &ProcessOptions) -> Result<Option<Engine>, String> {
+        if !opts.use_waifu2x {
+            return Ok(None);
+        }
         let factor = match opts.upscale.as_str() {
             "2x" => 2u32,
             "4x" => 4,
@@ -138,6 +141,9 @@ fn run_pass(
         }
     }
 
+    // 진단: 입력 값 범위
+    let in_mean = data.iter().map(|&v| v as f64).sum::<f64>() / data.len() as f64;
+
     let input =
         ort::value::Tensor::from_array(([1usize, 3, ph as usize, pw as usize], data))
             .map_err(|e| e.to_string())?;
@@ -147,6 +153,31 @@ fn run_pass(
         .map_err(|e| e.to_string())?;
     let oh = shape[2] as u32;
     let ow = shape[3] as u32;
+
+    // 진단: 출력 값 범위 (검은 결과물 원인 추적)
+    if pass == 1 {
+        let mut mn = f32::MAX;
+        let mut mx = f32::MIN;
+        let mut sum = 0f64;
+        for &v in out.iter() {
+            if v < mn {
+                mn = v;
+            }
+            if v > mx {
+                mx = v;
+            }
+            sum += v as f64;
+        }
+        let out_mean = sum / out.len() as f64;
+        emit_log(
+            app,
+            "info",
+            format!(
+                "진단 shape=[{:?}] 입력mean={in_mean:.4} 출력 min={mn:.4} max={mx:.4} mean={out_mean:.4}",
+                &shape
+            ),
+        );
+    }
     let scale = (ow as f32 / pw as f32).round().max(1.0) as u32;
 
     let oplane = (ow * oh) as usize;
