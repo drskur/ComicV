@@ -4,3 +4,6 @@ dist
 
 # ONNX 모델 가중치 (scripts/fetch-models.ps1로 받음)
 src-tauri/resources/models/
+
+# waifu2x-ncnn-vulkan 번들 바이너리·모델 (별도 배포, 저장소에 넣지 않음)
+src-tauri/resources/waifu2x-ncnn-vulkan/

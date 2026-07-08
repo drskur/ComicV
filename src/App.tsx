@@ -1,4 +1,4 @@
-import { createSignal, For, Show, onMount } from "solid-js";
+import { createSignal, For, Show, onMount, createMemo } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -35,6 +35,15 @@ interface SourceItem {
   path: string;
 }
 
+// 백엔드 prepare_pages가 돌려주는 페이지 프리뷰
+interface PagePreview {
+  id: number;
+  name: string;
+  thumb: string;
+  width: number;
+  height: number;
+}
+
 const logColor: Record<LogLevel, string> = {
   info: "text-ink",
   success: "text-ok",
@@ -50,22 +59,35 @@ function App() {
   // ── 옵션 ─────────────────────────────────
   // waifu2x: 업스케일 배율(-s) + 노이즈 제거 레벨(-n)
   const [useWaifu2x, setUseWaifu2x] = createSignal(true);
+  const [useGpu, setUseGpu] = createSignal(false);
   const [upscale, setUpscale] = createSignal("2x");
   const [denoiseLevel, setDenoiseLevel] = createSignal("1");
+  const [resizeToOriginal, setResizeToOriginal] = createSignal(true);
 
   // 종이 화이트닝: 스캔 배경색을 흰색으로
   const [whiten, setWhiten] = createSignal(true);
   const [whiteStrength, setWhiteStrength] = createSignal(70);
   const [keepColor, setKeepColor] = createSignal(true);
 
+  // 페이지 분할: 양쪽(스프레드) 페이지를 2장으로
+  const [splitPages, setSplitPages] = createSignal(false);
+  const [splitDirection, setSplitDirection] = createSignal("rl");
+
   const [format, setFormat] = createSignal("cbz");
-  const [quality, setQuality] = createSignal(100);
+  const [quality, setQuality] = createSignal(92);
   const [outputDir, setOutputDir] = createSignal("");
+
+  // ── 프리뷰 / 선택 상태 ─────────────────────
+  const [pages, setPages] = createSignal<PagePreview[]>([]);
+  const [selected, setSelected] = createSignal<Set<number>>(new Set());
+  const [preparing, setPreparing] = createSignal(false);
+  const selectedCount = createMemo(() => selected().size);
 
   // ── 실행 상태 ─────────────────────────────
   const [running, setRunning] = createSignal(false);
   const [progress, setProgress] = createSignal(0);
   const [logs, setLogs] = createSignal<LogLine[]>([]);
+  const [logOpen, setLogOpen] = createSignal(false);
 
   function pushLog(level: LogLevel, message: string) {
     const time = new Date().toLocaleTimeString("ko-KR", { hour12: false });
@@ -90,6 +112,7 @@ function App() {
         .map((p) => ({ id: nextId++, name: baseName(p), path: p }));
       return [...prev, ...added];
     });
+    void prepare();
   }
 
   async function addFiles() {
@@ -114,10 +137,13 @@ function App() {
 
   function removeSource(id: number) {
     setSources((prev) => prev.filter((s) => s.id !== id));
+    void prepare();
   }
 
   function clearSources() {
     setSources([]);
+    setPages([]);
+    setSelected(new Set());
   }
 
   async function pickOutputDir() {
@@ -125,19 +151,78 @@ function App() {
     if (typeof dir === "string") setOutputDir(dir);
   }
 
+  // ── 페이지 준비(추출 + 분할 + 썸네일) ────────
+  // 소스나 분할 옵션이 바뀌면 다시 호출. 모든 페이지가 선택된 상태로 시작.
+  async function prepare() {
+    const paths = sources().map((s) => s.path);
+    if (paths.length === 0) {
+      setPages([]);
+      setSelected(new Set());
+      return;
+    }
+    if (running()) return;
+    setPreparing(true);
+    try {
+      const result = await invoke<PagePreview[]>("prepare_pages", {
+        sources: paths,
+        splitPages: splitPages(),
+        splitDirection: splitDirection(),
+      });
+      setPages(result);
+      setSelected(new Set(result.map((p) => p.id))); // 전체 선택
+    } catch (err) {
+      pushLog("error", String(err));
+      setPages([]);
+      setSelected(new Set());
+    } finally {
+      setPreparing(false);
+    }
+  }
+
+  // 분할 옵션 변경 → 페이지 재구성(선택 초기화)
+  function setSplit(on: boolean) {
+    setSplitPages(on);
+    void prepare();
+  }
+  function setDirection(dir: string) {
+    setSplitDirection(dir);
+    if (splitPages()) void prepare();
+  }
+
+  // ── 페이지 선택 토글 ───────────────────────
+  function toggle(id: number) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+  function selectAll() {
+    setSelected(new Set(pages().map((p) => p.id)));
+  }
+  function selectNone() {
+    setSelected(new Set());
+  }
+
   // ── 시작 ─────────────────────────────────
   async function start() {
-    if (running() || sources().length === 0) return;
+    if (running() || selectedCount() === 0) return;
     setRunning(true);
     setProgress(0);
     setLogs([]);
+    setLogOpen(true);
+    // 준비된 순서대로 선택된 id만 전달.
+    const ids = pages().map((p) => p.id).filter((id) => selected().has(id));
     try {
       await invoke("start_processing", {
-        sources: sources().map((s) => s.path),
+        selectedIds: ids,
         options: {
           useWaifu2x: useWaifu2x(),
+          useGpu: useGpu(),
           upscale: upscale(),
           denoiseLevel: denoiseLevel(),
+          resizeToOriginal: resizeToOriginal(),
           whiten: whiten(),
           whiteStrength: whiteStrength(),
           keepColor: keepColor(),
@@ -177,10 +262,10 @@ function App() {
           fallback={
             <button
               class="bg-accent hover:bg-accent-hover disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-lg px-5 py-2.5 text-[15px] font-semibold cursor-pointer transition-colors"
-              disabled={sources().length === 0}
+              disabled={selectedCount() === 0}
               onClick={start}
             >
-              ▶ 시작
+              ▶ 시작 <Show when={selectedCount() > 0}><span class="opacity-80">({selectedCount()})</span></Show>
             </button>
           }
         >
@@ -193,7 +278,7 @@ function App() {
         </Show>
       </header>
 
-      {/* 본문: 사이드바(소스+옵션) + 콘솔 */}
+      {/* 본문: 사이드바(소스+옵션) + 프리뷰/로그 */}
       <div class="grid grid-cols-[300px_1fr] gap-3.5 flex-1 min-h-0">
         <aside class="flex flex-col gap-3.5 min-h-0">
           {/* 소스 패널 */}
@@ -209,7 +294,7 @@ function App() {
               </div>
             </div>
 
-            <div class="overflow-y-auto p-2 max-h-[200px]">
+            <div class="overflow-y-auto p-2 max-h-[180px]">
               <Show
                 when={sources().length > 0}
                 fallback={
@@ -249,6 +334,11 @@ function App() {
                 <span>waifu2x 사용 <span class="text-muted">(끄면 변환만)</span></span>
               </label>
 
+              <label class="flex items-center gap-2 text-[13px] cursor-pointer" classList={{ "opacity-40 pointer-events-none": !useWaifu2x() }}>
+                <input type="checkbox" class={CHECKBOX} checked={useGpu()} onChange={(e) => setUseGpu(e.currentTarget.checked)} />
+                <span>GPU 가속 <span class="text-muted">(Vulkan · ncnn)</span></span>
+              </label>
+
               <label class="flex flex-col gap-1.5 text-[13px]" classList={{ "opacity-40 pointer-events-none": !useWaifu2x() }}>
                 <span class="text-muted">업스케일 배율</span>
                 <select
@@ -274,6 +364,32 @@ function App() {
                   <option value="1">1 (기본)</option>
                   <option value="2">2 (강)</option>
                   <option value="3">3 (최강)</option>
+                </select>
+              </label>
+
+              <label class="flex items-center gap-2 text-[13px] cursor-pointer" classList={{ "opacity-40 pointer-events-none": !useWaifu2x() || upscale() === "none" }}>
+                <input type="checkbox" class={CHECKBOX} checked={resizeToOriginal()} onChange={(e) => setResizeToOriginal(e.currentTarget.checked)} />
+                <span>원본 크기로 축소 <span class="text-muted">(노이즈·용량↓)</span></span>
+              </label>
+            </div>
+
+            <div class="p-3.5 border-b border-edge flex flex-col gap-3">
+              <h3 class="text-xs font-semibold uppercase tracking-wider text-muted m-0">페이지 분할</h3>
+
+              <label class="flex items-center gap-2 text-[13px] cursor-pointer">
+                <input type="checkbox" class={CHECKBOX} checked={splitPages()} onChange={(e) => setSplit(e.currentTarget.checked)} />
+                <span>양쪽 페이지를 2장으로 분할 <span class="text-muted">(가로가 긴 페이지만)</span></span>
+              </label>
+
+              <label class="flex flex-col gap-1.5 text-[13px]" classList={{ "opacity-40 pointer-events-none": !splitPages() }}>
+                <span class="text-muted">읽는 방향</span>
+                <select
+                  class={FIELD_CONTROL}
+                  value={splitDirection()}
+                  onChange={(e) => setDirection(e.currentTarget.value)}
+                >
+                  <option value="rl">RL · 우철 (오른쪽 → 왼쪽, 일본만화)</option>
+                  <option value="lr">LR · 좌철 (왼쪽 → 오른쪽)</option>
                 </select>
               </label>
             </div>
@@ -349,28 +465,106 @@ function App() {
           </section>
         </aside>
 
-        {/* 진행 + 로그 (메인) */}
-        <section class="bg-panel border border-edge rounded-[10px] flex flex-col min-h-0">
-          <div class="flex items-center justify-between px-3.5 py-2.5 border-b border-edge">
-            <h2 class="text-sm font-semibold">진행 로그</h2>
-            <div class="flex items-center gap-2.5 w-[45%]">
-              <div class="flex-1 h-1.5 bg-panel2 rounded-full overflow-hidden">
-                <div class="h-full bg-accent transition-[width] duration-300" style={{ width: `${progress()}%` }} />
+        {/* 메인: 프리뷰 그리드(전체폭) + 하단 접이식 로그 */}
+        <section class="flex flex-col gap-3.5 min-h-0">
+          {/* 프리뷰 그리드 */}
+          <div class="bg-panel border border-edge rounded-[10px] flex flex-col flex-1 min-h-0">
+            <div class="flex items-center justify-between px-3.5 py-2.5 border-b border-edge">
+              <div class="flex items-center gap-2.5">
+                <h2 class="text-sm font-semibold">페이지</h2>
+                <Show when={pages().length > 0}>
+                  <span class="text-xs text-muted">{selectedCount()} / {pages().length} 선택</span>
+                </Show>
+                <Show when={preparing()}>
+                  <span class="text-xs text-accent">준비 중…</span>
+                </Show>
               </div>
-              <span class="text-xs text-muted min-w-[34px] text-right">{progress()}%</span>
+              <Show when={pages().length > 0}>
+                <div class="flex gap-1.5">
+                  <button class={BTN_GHOST} onClick={selectAll}>전체 선택</button>
+                  <button class={BTN_GHOST} onClick={selectNone}>전체 해제</button>
+                </div>
+              </Show>
+            </div>
+
+            <div class="flex-1 overflow-y-auto p-3">
+              <Show
+                when={pages().length > 0}
+                fallback={
+                  <div class="flex flex-col items-center justify-center gap-1.5 text-muted text-center h-full">
+                    <p class="text-sm m-0">소스를 추가하면 페이지 미리보기가 표시됩니다</p>
+                    <span class="text-xs opacity-70">필요 없는 페이지는 선택 해제하세요</span>
+                  </div>
+                }
+              >
+                <div class="grid grid-cols-[repeat(auto-fill,minmax(120px,1fr))] gap-2.5">
+                  <For each={pages()}>
+                    {(p) => {
+                      const isSel = () => selected().has(p.id);
+                      return (
+                        <button
+                          onClick={() => toggle(p.id)}
+                          class="group relative flex flex-col items-center rounded-lg overflow-hidden border-2 bg-panel2 cursor-pointer transition-all p-0"
+                          classList={{
+                            "border-accent": isSel(),
+                            "border-transparent opacity-40 grayscale hover:opacity-70": !isSel(),
+                          }}
+                          title={p.name}
+                        >
+                          <div class="w-full aspect-[3/4] bg-black/20 flex items-center justify-center overflow-hidden">
+                            <img src={p.thumb} alt={p.name} class="max-w-full max-h-full object-contain" loading="lazy" />
+                          </div>
+                          {/* 선택 체크 배지 */}
+                          <div
+                            class="absolute top-1.5 right-1.5 w-5 h-5 rounded-full flex items-center justify-center text-[11px] font-bold border transition-colors"
+                            classList={{
+                              "bg-accent text-white border-accent": isSel(),
+                              "bg-black/40 text-transparent border-white/40": !isSel(),
+                            }}
+                          >
+                            ✓
+                          </div>
+                          <span class="w-full text-[11px] text-muted truncate px-1.5 py-1 text-center">{p.name}</span>
+                        </button>
+                      );
+                    }}
+                  </For>
+                </div>
+              </Show>
             </div>
           </div>
 
-          <div class="flex-1 overflow-y-auto px-3.5 py-2.5 font-mono text-xs">
-            <Show when={logs().length > 0} fallback={<div class="text-muted opacity-60">시작하면 여기에 로그가 표시됩니다.</div>}>
-              <For each={logs()}>
-                {(l) => (
-                  <div class="flex gap-2.5 py-px">
-                    <span class="text-muted shrink-0">{l.time}</span>
-                    <span class={logColor[l.level]}>{l.message}</span>
-                  </div>
-                )}
-              </For>
+          {/* 진행 + 로그 (접이식) */}
+          <div class="bg-panel border border-edge rounded-[10px] flex flex-col shrink-0" classList={{ "min-h-0 flex-1": logOpen() }}>
+            <div class="flex items-center justify-between px-3.5 py-2.5 border-b border-edge" classList={{ "border-b-0": !logOpen() }}>
+              <button class="flex items-center gap-1.5 bg-transparent border-none text-ink cursor-pointer p-0" onClick={() => setLogOpen((v) => !v)}>
+                <span class="text-muted text-xs transition-transform" classList={{ "rotate-90": logOpen() }}>▸</span>
+                <h2 class="text-sm font-semibold">진행 로그</h2>
+                <Show when={logs().length > 0}>
+                  <span class="text-xs text-muted">({logs().length})</span>
+                </Show>
+              </button>
+              <div class="flex items-center gap-2.5 w-[45%]">
+                <div class="flex-1 h-1.5 bg-panel2 rounded-full overflow-hidden">
+                  <div class="h-full bg-accent transition-[width] duration-300" style={{ width: `${progress()}%` }} />
+                </div>
+                <span class="text-xs text-muted min-w-[34px] text-right">{progress()}%</span>
+              </div>
+            </div>
+
+            <Show when={logOpen()}>
+              <div class="flex-1 overflow-y-auto px-3.5 py-2.5 font-mono text-xs max-h-[260px]">
+                <Show when={logs().length > 0} fallback={<div class="text-muted opacity-60">시작하면 여기에 로그가 표시됩니다.</div>}>
+                  <For each={logs()}>
+                    {(l) => (
+                      <div class="flex gap-2.5 py-px">
+                        <span class="text-muted shrink-0">{l.time}</span>
+                        <span class={logColor[l.level]}>{l.message}</span>
+                      </div>
+                    )}
+                  </For>
+                </Show>
+              </div>
             </Show>
           </div>
         </section>

@@ -715,9 +715,11 @@ dependencies = [
 name = "comicv"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "image",
  "lopdf",
  "ort",
+ "rayon",
  "serde",
  "serde_json",
  "tauri",

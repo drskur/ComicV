@@ -24,13 +24,12 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 image = "0.25"
+rayon = "1"
 zip = "2"
 lopdf = "0.43"
+base64 = "0.22"
 
-# ONNX 추론 (Windows에서는 DirectML EP 활성화)
-[target.'cfg(windows)'.dependencies]
-ort = { version = "2.0.0-rc.12", features = ["directml"] }
-
-[target.'cfg(not(windows))'.dependencies]
+# ONNX 추론 — CPU 전용(ort). GPU 가속은 번들된 waifu2x-ncnn-vulkan(Vulkan)이 담당.
+# DirectML은 대상 기기(AMD Strix Halo iGPU)에서 출력이 0으로 붕괴해 제거함.
 ort = "2.0.0-rc.12"
 

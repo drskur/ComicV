@@ -1,4 +1,7 @@
-//! waifu2x(cunet) ONNX 추론 — ort + DirectML.
+//! waifu2x(cunet) ONNX 추론 — ort(CPU 전용).
+//!
+//! GPU 가속은 별도 ncnn(Vulkan) 백엔드(crate::ncnn)가 담당한다. DirectML은
+//! 대상 기기(AMD Strix Halo iGPU)에서 출력이 0으로 붕괴해 제거했다.
 //!
 //! 모델은 `resources/models/cunet/*.onnx` (deepghs/waifu2x_onnx, nunif 기반).
 //! 노이즈 레벨(-n)과 배율(-s) 조합으로 모델 파일을 고른다.
@@ -52,33 +55,22 @@ fn model_path(app: &AppHandle, name: &str) -> PathBuf {
         .join(name)
 }
 
-fn load_session(app: &AppHandle, name: &str) -> Result<Session, String> {
-    let path = model_path(app, name);
+fn load_session(path: &PathBuf, intra_threads: usize) -> Result<Session, String> {
     if !path.exists() {
         return Err(format!("모델 파일 없음: {}", path.display()));
     }
-    #[allow(unused_mut)]
+    // CPU 전용 경로. GPU 가속은 별도 ncnn(Vulkan) 백엔드가 담당(crate::ncnn).
+    // DirectML은 이 기기(AMD Strix Halo iGPU)에서 출력이 0으로 붕괴해 사용 불가.
+    //
+    // intra_threads: 세션 하나가 op 병렬에 쓸 스레드 수. 세션 풀로 페이지를 병렬
+    // 처리할 때, (워커 수 × intra_threads)가 코어를 과다구독하지 않도록 상위에서 제한.
     let mut builder = Session::builder().map_err(|e| e.to_string())?;
-
-    // 기본 CPU(정확). DirectML은 입력 크기에 따라 출력이 붕괴하는 오산이 있어
-    // 아직 신뢰 불가 → 실험적 opt-in(COMICV_DML=1). 안정화는 고정 타일로 예정.
-    let use_dml = std::env::var("COMICV_DML").ok().as_deref() == Some("1");
-    #[cfg(windows)]
-    if use_dml {
-        // DML이 융합된 연산을 오산하는 걸 우회: 그래프 최적화 끄기.
+    if intra_threads > 0 {
         builder = builder
-            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Disable)
-            .map_err(|e| e.to_string())?
-            .with_execution_providers([ort::ep::directml::DirectML::default().build()])
+            .with_intra_threads(intra_threads)
             .map_err(|e| e.to_string())?;
     }
-    log(
-        app,
-        "info",
-        format!("EP: {}", if use_dml { "DirectML" } else { "CPU" }),
-    );
-
-    builder.commit_from_file(&path).map_err(|e| e.to_string())
+    builder.commit_from_file(path).map_err(|e| e.to_string())
 }
 
 /// cunet offset(출력에서 잘리는 테두리, 출력 px 기준). 입력 패딩 = offset/scale.
@@ -94,9 +86,27 @@ pub struct Engine {
     passes: Vec<Pass>,
 }
 
+/// 옵션에서 실제 처리가 필요한지(엔진 로드 대상인지) 판정. 세션 풀 구성 전에
+/// 워커 수/스레드 배분을 정하려면 로드 없이 먼저 알아야 해서 분리.
+pub fn is_needed(opts: &ProcessOptions) -> bool {
+    if !opts.use_waifu2x {
+        return false;
+    }
+    let two_x = matches!(opts.upscale.as_str(), "2x" | "4x");
+    let denoise = denoise_opt(&opts.denoise_level);
+    base_model(two_x, denoise).is_some()
+}
+
 impl Engine {
     /// 옵션에 해당하는 엔진 구성. 처리할 게 없으면(1x·노이즈 없음) None.
-    pub fn new(app: &AppHandle, opts: &ProcessOptions) -> Result<Option<Engine>, String> {
+    /// `intra_threads`: 세션 하나의 op 병렬 스레드 수(0이면 ort 기본).
+    /// `quiet`: 세션 풀에서 여러 개 만들 때 로그 중복을 막기 위해 로그 억제.
+    pub fn new(
+        app: &AppHandle,
+        opts: &ProcessOptions,
+        intra_threads: usize,
+        quiet: bool,
+    ) -> Result<Option<Engine>, String> {
         if !opts.use_waifu2x {
             return Ok(None);
         }
@@ -115,52 +125,54 @@ impl Engine {
 
         // 1x 모델 offset 28(scale 1 → pad 28), 2x 모델 offset 36(scale 2 → pad 18).
         let first_pad = if two_x { OFFSET_2X / 2 } else { OFFSET_1X };
-        log(app, "info", format!("waifu2x 모델 로드: {first}"));
+        if !quiet {
+            log(app, "info", format!("waifu2x 모델 로드(CPU): {first}"));
+        }
         let mut passes = vec![Pass {
-            session: load_session(app, &first)?,
+            session: load_session(&model_path(app, &first), intra_threads)?,
             pad: first_pad,
         }];
         if factor == 4 {
-            log(app, "info", "waifu2x 모델 로드: scale2x.onnx (4x 2번째 패스)".to_string());
+            if !quiet {
+                log(app, "info", "waifu2x 모델 로드(CPU): scale2x.onnx (4x 2번째 패스)".to_string());
+            }
             passes.push(Pass {
-                session: load_session(app, "scale2x.onnx")?,
+                session: load_session(&model_path(app, "scale2x.onnx"), intra_threads)?,
                 pad: OFFSET_2X / 2,
             });
         }
         Ok(Some(Engine { passes }))
     }
 
-    pub fn process(&mut self, img: &RgbImage, app: &AppHandle) -> Result<RgbImage, String> {
-        let total = self.passes.len();
+    pub fn process(&mut self, img: &RgbImage) -> Result<RgbImage, String> {
         let mut cur = img.clone();
         for i in 0..self.passes.len() {
             let pad = self.passes[i].pad;
-            cur = run_pass(&mut self.passes[i].session, pad, &cur, app, i + 1, total)?;
+            cur = run_pass(&mut self.passes[i].session, pad, &cur)?;
         }
         Ok(cur)
     }
 }
 
-fn run_pass(
+/// 원본 `img`에서 (ox,oy)를 좌상단으로 하는 pw×ph 입력 텐서를 만들어 추론한다.
+/// 각 입력 px는 `clamp(ox - pad + x, 0, w-1)`에서 샘플 → 전 이미지 경계에 엣지 복제.
+/// 반환: (출력 f32 planar, ow, oh). 모델이 offset을 잘라내므로 ow ≈ (pw-2*pad)*scale.
+fn infer(
     sess: &mut Session,
-    pad: u32,
     img: &RgbImage,
-    app: &AppHandle,
-    pass: usize,
-    total: usize,
-) -> Result<RgbImage, String> {
+    ox: i64,
+    oy: i64,
+    pad: u32,
+    pw: u32,
+    ph: u32,
+) -> Result<(Vec<f32>, u32, u32), String> {
     let (w, h) = (img.width(), img.height());
-
-    // 사방 pad(입력 px)만큼 엣지 복제 + 4의 배수로 정렬(우/하단 여분).
-    // 이렇게 하면 모델이 offset을 잘라도 출력 좌상단이 원본 (0,0)과 정렬됨.
-    let pw = (w + 2 * pad + 3) / 4 * 4;
-    let ph = (h + 2 * pad + 3) / 4 * 4;
     let plane = (pw * ph) as usize;
     let mut data = vec![0f32; 3 * plane];
     for y in 0..ph {
-        let sy = ((y as i64 - pad as i64).clamp(0, (h - 1) as i64)) as u32;
+        let sy = ((oy - pad as i64 + y as i64).clamp(0, (h - 1) as i64)) as u32;
         for x in 0..pw {
-            let sx = ((x as i64 - pad as i64).clamp(0, (w - 1) as i64)) as u32;
+            let sx = ((ox - pad as i64 + x as i64).clamp(0, (w - 1) as i64)) as u32;
             let px = img.get_pixel(sx, sy);
             let idx = (y * pw + x) as usize;
             data[idx] = px[0] as f32 / 255.0;
@@ -169,52 +181,47 @@ fn run_pass(
         }
     }
 
-    let input =
-        ort::value::Tensor::from_array(([1usize, 3, ph as usize, pw as usize], data))
-            .map_err(|e| e.to_string())?;
+    let input = ort::value::Tensor::from_array(([1usize, 3, ph as usize, pw as usize], data))
+        .map_err(|e| e.to_string())?;
     let outputs = sess.run(ort::inputs![input]).map_err(|e| e.to_string())?;
     let (shape, out) = outputs[0]
         .try_extract_tensor::<f32>()
         .map_err(|e| e.to_string())?;
     let oh = shape[2] as u32;
     let ow = shape[3] as u32;
+    Ok((out.to_vec(), ow, oh))
+}
 
-    // 출력 붕괴 감지(예: DML 오산). 정상이면 조용히 넘어감.
-    if pass == 1 {
-        let out_mean = out.iter().map(|&v| v as f64).sum::<f64>() / out.len() as f64;
-        if out_mean < 0.05 {
-            log(
-                app,
-                "warn",
-                format!("출력이 비정상적으로 어두움(mean={out_mean:.4}) — 엔진/EP 확인 필요"),
-            );
-        }
-    }
-    let scale = (ow as f32 / pw as f32).round().max(1.0) as u32;
-
+/// planar f32 출력의 (sx,sy)~(sx+cw,sy+ch) 영역을 dst의 (dx,dy)에 복사.
+fn blit(dst: &mut RgbImage, out: &[f32], ow: u32, oh: u32, sx: u32, sy: u32, cw: u32, ch: u32, dx: u32, dy: u32) {
     let oplane = (ow * oh) as usize;
-    let mut full = RgbImage::new(ow, oh);
-    for y in 0..oh {
-        for x in 0..ow {
-            let idx = (y * ow + x) as usize;
+    for y in 0..ch {
+        for x in 0..cw {
+            let idx = ((sy + y) * ow + (sx + x)) as usize;
             let r = (out[idx] * 255.0).round().clamp(0.0, 255.0) as u8;
             let g = (out[oplane + idx] * 255.0).round().clamp(0.0, 255.0) as u8;
             let b = (out[2 * oplane + idx] * 255.0).round().clamp(0.0, 255.0) as u8;
-            full.put_pixel(x, y, Rgb([r, g, b]));
+            dst.put_pixel(dx + x, dy + y, Rgb([r, g, b]));
         }
     }
+}
+
+/// whole-image 추론(CPU 경로). 이미지 전체를 한 번에 모델에 넣는다.
+fn run_pass(sess: &mut Session, pad: u32, img: &RgbImage) -> Result<RgbImage, String> {
+    let (w, h) = (img.width(), img.height());
+
+    // 사방 pad(입력 px)만큼 엣지 복제 + 4의 배수로 정렬(우/하단 여분).
+    // 이렇게 하면 모델이 offset을 잘라도 출력 좌상단이 원본 (0,0)과 정렬됨.
+    let pw = (w + 2 * pad + 3) / 4 * 4;
+    let ph = (h + 2 * pad + 3) / 4 * 4;
+    let (out, ow, oh) = infer(sess, img, 0, 0, pad, pw, ph)?;
+
+    let scale = (ow as f32 / pw as f32).round().max(1.0) as u32;
 
     // 패딩 제거: 원본*scale 만큼만 좌상단 기준으로 크롭.
     let cw = (w * scale).min(ow);
     let ch = (h * scale).min(oh);
-    let cropped = image::imageops::crop_imm(&full, 0, 0, cw, ch).to_image();
-
-    if pass == 1 {
-        log(
-            app,
-            "info",
-            format!("waifu2x {pass}/{total}: {w}x{h} → {ow}x{oh} (scale {scale})"),
-        );
-    }
+    let mut cropped = RgbImage::new(cw, ch);
+    blit(&mut cropped, &out, ow, oh, 0, 0, cw, ch, 0, 0);
     Ok(cropped)
 }

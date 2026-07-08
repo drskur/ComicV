@@ -1,4 +1,5 @@
 mod events;
+mod ncnn;
 mod pdf;
 mod pipeline;
 mod waifu2x;
@@ -9,7 +10,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(pipeline::CancelFlag::default())
+        .manage(pipeline::PreparedPages::default())
         .invoke_handler(tauri::generate_handler![
+            pipeline::prepare_pages,
             pipeline::start_processing,
             pipeline::cancel_processing
         ])
